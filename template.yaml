@@ -1,0 +1,416 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AgentAuth Launchpad - Deploy OAuth for AI Agents with one click'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type (t3.small recommended)
+
+  AdminEmail:
+    Type: String
+    Description: Admin email for notifications and SSL
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret key for JWT tokens (leave blank to auto-generate)
+    Default: ''
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Password for PostgreSQL database (min 8 characters)
+
+  DomainName:
+    Type: String
+    Description: Custom domain (optional)
+    Default: ''
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+      - Label:
+          default: "Security"
+        Parameters:
+          - DatabasePassword
+          - JwtSecret
+      - Label:
+          default: "Access"
+        Parameters:
+          - AdminEmail
+          - DomainName
+
+Resources:
+  # VPC and Networking
+  AgentAuthVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: agentauth-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AgentAuthVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: agentauth-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AgentAuthVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: agentauth-private-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: agentauth-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AgentAuthVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AgentAuthVPC
+      Tags:
+        - Key: Name
+          Value: agentauth-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # Security Groups
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for AgentAuth instance
+      VpcId: !Ref AgentAuthVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (redirects to HTTPS)
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Frontend
+        - IpProtocol: tcp
+          FromPort: 4000
+          ToPort: 4000
+          CidrIp: 0.0.0.0/0
+          Description: Backend API
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: agentauth-sg
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for PostgreSQL
+      VpcId: !Ref AgentAuthVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: PostgreSQL from app
+      Tags:
+        - Key: Name
+          Value: agentauth-db-sg
+
+  # Secrets Manager
+  AgentAuthSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agentauth-secrets
+      Description: Secrets for AgentAuth
+      SecretString: !Sub |
+        {
+          "JWT_SECRET": "${JwtSecret}",
+          "DATABASE_PASSWORD": "${DatabasePassword}",
+          "ADMIN_EMAIL": "${AdminEmail}"
+        }
+
+  # IAM Role
+  AgentAuthInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AgentAuthSecrets
+
+  AgentAuthInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AgentAuthInstanceRole
+
+  # EC2 Instance
+  AgentAuthInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      IamInstanceProfile: !Ref AgentAuthInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # Update system
+          apt-get update && apt-get upgrade -y
+
+          # Install dependencies
+          apt-get install -y curl git jq awscli postgresql postgresql-contrib
+
+          # Install Node.js 20
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          apt-get install -y nodejs
+
+          # Get secrets
+          SECRETS=$(aws secretsmanager get-secret-value --secret-id agentauth-secrets --region ${AWS::Region} --query SecretString --output text)
+          DB_PASSWORD=$(echo "$SECRETS" | jq -r '.DATABASE_PASSWORD')
+          JWT_SECRET=$(echo "$SECRETS" | jq -r '.JWT_SECRET')
+          ADMIN_EMAIL=$(echo "$SECRETS" | jq -r '.ADMIN_EMAIL')
+
+          # Generate JWT secret if not provided
+          if [ -z "$JWT_SECRET" ] || [ "$JWT_SECRET" = "null" ]; then
+            JWT_SECRET=$(openssl rand -hex 32)
+          fi
+
+          # Setup PostgreSQL
+          sudo -u postgres psql -c "CREATE USER agentauth WITH PASSWORD '$DB_PASSWORD';"
+          sudo -u postgres psql -c "CREATE DATABASE agentauth OWNER agentauth;"
+          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE agentauth TO agentauth;"
+
+          # Clone and setup AgentAuth
+          cd /opt
+          git clone https://github.com/yksanjo/agent-auth-mvp.git agentauth
+          cd agentauth
+
+          # Create environment file
+          cat > .env <<EOF
+          NODE_ENV=production
+          JWT_SECRET=$JWT_SECRET
+          DATABASE_URL=postgresql://agentauth:$DB_PASSWORD@localhost:5432/agentauth
+          ADMIN_EMAIL=$ADMIN_EMAIL
+          PORT=4000
+          FRONTEND_URL=http://localhost:3000
+          EOF
+
+          # Install dependencies
+          npm install
+          cd frontend && npm install && cd ..
+
+          # Run database migrations
+          cd backend
+          npm run migrate
+          cd ..
+
+          # Build frontend
+          cd frontend
+          npm run build
+          cd ..
+
+          # Install PM2 for process management
+          npm install -g pm2
+
+          # Create PM2 ecosystem file
+          cat > ecosystem.config.js <<EOF
+          module.exports = {
+            apps: [
+              {
+                name: 'agentauth-backend',
+                cwd: '/opt/agentauth/backend',
+                script: 'npm',
+                args: 'start',
+                env: {
+                  NODE_ENV: 'production',
+                  PORT: 4000
+                }
+              },
+              {
+                name: 'agentauth-frontend',
+                cwd: '/opt/agentauth/frontend',
+                script: 'npm',
+                args: 'start',
+                env: {
+                  NODE_ENV: 'production',
+                  PORT: 3000
+                }
+              }
+            ]
+          };
+          EOF
+
+          # Start services
+          pm2 start ecosystem.config.js
+          pm2 save
+          pm2 startup systemd -u root --hp /root
+
+          # Install Caddy for reverse proxy
+          apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+          apt-get update
+          apt-get install caddy -y
+
+          # Configure Caddy
+          cat > /etc/caddy/Caddyfile <<EOF
+          :80 {
+            handle /api/* {
+              reverse_proxy localhost:4000
+            }
+            handle {
+              reverse_proxy localhost:3000
+            }
+          }
+          EOF
+
+          systemctl restart caddy
+
+          echo "AgentAuth installation complete!"
+      Tags:
+        - Key: Name
+          Value: agentauth-instance
+
+  # Elastic IP
+  AgentAuthEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: agentauth-eip
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref AgentAuthInstance
+      EIP: !Ref AgentAuthEIP
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c7217cdde317cfec
+    us-east-2:
+      AMI: ami-05fb0b8c1424f266b
+    us-west-1:
+      AMI: ami-0ce2cb35386fc22e9
+    us-west-2:
+      AMI: ami-008fe2fc65df48dac
+    eu-west-1:
+      AMI: ami-0905a3c97561e0b69
+    eu-central-1:
+      AMI: ami-0faab6bdbac9486fb
+    ap-northeast-1:
+      AMI: ami-0d52744d6551d851e
+    ap-southeast-1:
+      AMI: ami-0df7a207adb9748c7
+    ap-southeast-2:
+      AMI: ami-0310483fb2b488153
+
+Outputs:
+  DashboardURL:
+    Description: AgentAuth Dashboard URL
+    Value: !Sub 'http://${AgentAuthEIP}'
+
+  APIURL:
+    Description: AgentAuth API URL
+    Value: !Sub 'http://${AgentAuthEIP}/api'
+
+  InstancePublicIP:
+    Description: Public IP address
+    Value: !Ref AgentAuthEIP
+
+  SSHCommand:
+    Description: SSH command to connect
+    Value: !Sub 'ssh ubuntu@${AgentAuthEIP}'
+
+  NextSteps:
+    Description: What to do next
+    Value: |
+      1. Wait 5-10 minutes for installation
+      2. Visit the Dashboard URL
+      3. Create your first agent
+      4. Generate permission grants
+      5. Integrate with your services
